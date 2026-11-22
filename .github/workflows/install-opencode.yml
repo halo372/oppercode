@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: YouTube video URL (use the video matching YOUTUBE_PO_TOKEN)
+        description: YouTube video URL
         required: true
         type: string
 
@@ -28,21 +28,15 @@ jobs:
       - name: Install OpenCode CLI and yt-dlp
         run: |
           npm install -g @opencode/cli
-          python -m pip install --upgrade yt-dlp
+          python -m pip install --upgrade yt-dlp bgutil-ytdlp-pot-provider==2.0.2
           opencode --version
           yt-dlp --version
 
       - name: Fetch an English transcript
         env:
           VIDEO_URL: ${{ inputs.video_url }}
-          YOUTUBE_PO_TOKEN: ${{ secrets.YOUTUBE_PO_TOKEN }}
         run: |
           set -euo pipefail
-
-          if [[ -z "$YOUTUBE_PO_TOKEN" ]]; then
-            echo "::error::Set the YOUTUBE_PO_TOKEN Actions secret to a PO token matching the selected video."
-            exit 1
-          fi
 
           python - <<'PY'
           import os
@@ -57,6 +51,26 @@ jobs:
           transcript_dir="$RUNNER_TEMP/opencode-transcript"
           mkdir -p "$transcript_dir"
 
+          docker run --detach --rm \
+            --name bgutil-ytdlp-pot-provider \
+            --publish 127.0.0.1:4416:4416 \
+            brainicism/bgutil-ytdlp-pot-provider:2.0.2
+          trap 'docker stop bgutil-ytdlp-pot-provider >/dev/null' EXIT
+
+          provider_ready=false
+          for attempt in {1..30}; do
+            if curl --silent --output /dev/null --max-time 1 http://127.0.0.1:4416; then
+              provider_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$provider_ready" != true ]]; then
+            echo "::error::The bgutil PO token provider did not become ready."
+            docker logs bgutil-ytdlp-pot-provider
+            exit 1
+          fi
+
           yt-dlp \
             --ignore-config \
             --skip-download \
@@ -67,7 +81,6 @@ jobs:
             --output "$transcript_dir/transcript.%(ext)s" \
             --sleep-requests 10 \
             --sleep-subtitles 10 \
-            --extractor-args "youtube:player_client=mweb;po_token=mweb.gvs+$YOUTUBE_PO_TOKEN" \
             "$VIDEO_URL"
 
           transcript="$(find "$transcript_dir" -maxdepth 1 -type f -name 'transcript*.vtt' -print -quit)"

@@ -25,6 +25,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate Tailscale configuration
+        env:
+          TAILSCALE_EXIT_NODE: ${{ vars.TAILSCALE_EXIT_NODE }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAILSCALE_EXIT_NODE" || -z "$TS_OAUTH_CLIENT_ID" || -z "$TS_OAUTH_SECRET" ]]; then
+            echo "::error::Set the TAILSCALE_EXIT_NODE repository variable and TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET repository secrets."
+            exit 1
+          fi
+
+      - name: Connect to Tailscale through the Android exit node
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          args: --exit-node=${{ vars.TAILSCALE_EXIT_NODE }}
+
       - name: Install OpenCode CLI and yt-dlp
         run: |
           npm install -g @opencode/cli
@@ -35,6 +55,7 @@ jobs:
       - name: Fetch an English transcript
         env:
           VIDEO_URL: ${{ inputs.video_url }}
+          ROTATING_PROXY_URLS: ${{ secrets.ROTATING_PROXY_URLS }}
         run: |
           set -euo pipefail
 
@@ -49,28 +70,69 @@ jobs:
           PY
 
           transcript_dir="$RUNNER_TEMP/opencode-transcript"
+          rm -rf "$transcript_dir"
           mkdir -p "$transcript_dir"
 
-          yt-dlp \
-            --ignore-config \
-            --js-runtimes node \
-            --extractor-args "youtube:player_client=mweb,tv" \
-            --skip-download \
-            --write-subs \
-            --write-auto-subs \
-            --sub-langs 'en.*' \
-            --sub-format vtt \
-            --output "$transcript_dir/transcript.%(ext)s" \
-            --sleep-requests 10 \
-            --sleep-subtitles 10 \
-            "$VIDEO_URL"
+          fetch_transcript() {
+            local proxy="${1:-}"
+            local args=(
+              --ignore-config
+              --js-runtimes node
+              --extractor-args "youtube:player_client=mweb,tv"
+              --skip-download
+              --write-subs
+              --write-auto-subs
+              --sub-langs 'en.*'
+              --sub-format vtt
+              --output "$transcript_dir/transcript.%(ext)s"
+              --sleep-requests 10
+              --sleep-subtitles 10
+            )
+            if [[ -n "$proxy" ]]; then
+              args+=(--proxy "$proxy")
+            fi
+            yt-dlp "${args[@]}" "$VIDEO_URL"
+          }
 
-          transcript="$(find "$transcript_dir" -maxdepth 1 -type f -name 'transcript*.vtt' -print -quit)"
-          if [[ -z "$transcript" ]]; then
-            echo "::error::No English captions were available for this video."
+          if [[ -z "${ROTATING_PROXY_URLS:-}" ]]; then
+            echo "Fetching transcript through the Tailscale exit node"
+            if fetch_transcript; then
+              transcript="$(find "$transcript_dir" -maxdepth 1 -type f -name 'transcript*.vtt' -print -quit)"
+              if [[ -n "$transcript" ]]; then
+                mv "$transcript" "$transcript_dir/transcript.vtt"
+              fi
+            fi
+          else
+            proxy_count=0
+            while IFS= read -r proxy; do
+              proxy="${proxy#"${proxy%%[![:space:]]*}"}"
+              proxy="${proxy%"${proxy##*[![:space:]]}"}"
+              [[ -z "$proxy" ]] && continue
+
+              proxy_count=$((proxy_count + 1))
+              echo "Trying rotating proxy $proxy_count"
+
+              if fetch_transcript "$proxy"; then
+                transcript="$(find "$transcript_dir" -maxdepth 1 -type f -name 'transcript*.vtt' -print -quit)"
+                if [[ -n "$transcript" ]]; then
+                  mv "$transcript" "$transcript_dir/transcript.vtt"
+                  break
+                fi
+              fi
+
+              find "$transcript_dir" -maxdepth 1 -type f -delete
+            done <<< "$ROTATING_PROXY_URLS"
+
+            if [[ "$proxy_count" -eq 0 ]]; then
+              echo "::error::The ROTATING_PROXY_URLS secret contains no proxy URLs."
+              exit 1
+            fi
+          fi
+
+          if [[ ! -f "$transcript_dir/transcript.vtt" ]]; then
+            echo "::error::No English captions were available for this video through the Tailscale exit node or configured proxies."
             exit 1
           fi
-          mv "$transcript" "$transcript_dir/transcript.vtt"
 
       - name: Ask OpenCode to confirm the setup
         working-directory: ${{ runner.temp }}/opencode-transcript
